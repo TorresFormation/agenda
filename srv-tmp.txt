@@ -1,0 +1,931 @@
+/* =====================================================================
+   TORRES FORMATION — Agenda de réservation (Google Apps Script)
+   1) Exécuter une fois la fonction  installer
+   2) Déployer > Nouveau déploiement > Application Web
+      (Exécuter en tant que : Moi — Accès : Tout le monde)
+   ===================================================================== */
+var TF_CONFIG = {
+  contact: { nom: 'Maïcol Torres', tel: '06 29 44 49 97', email: 't.maicol.formation@gmail.com', zone: 'Île-de-France · Eure-et-Loir · Normandie' },
+  minDelai: 1,        // réservable dès le lendemain (pour le jour même : par téléphone)
+  horizon: 365,       // jours réservables à l'avance
+  heureDebut: '08:00', heureFin: '18:00', // un rendez-vous Google « Occupé » dans cette plage rend le jour indisponible
+  tz: 'Europe/Paris',
+  pagesUrl: 'https://torresformation.github.io/agenda/', // adresse publique courte de l'agenda (GitHub Pages)
+  // Agendas Google lus pour bloquer les dates (tous ceux du compte, sauf ceux dont le nom correspond) :
+  ignorer: /f[ée]ri[ée]s|holiday|vacances|anniversaire|birthday|semaine|week ?number|contacts|t[âa]ches|tasks/i,
+  ignorerEvt: /anniversaire|birthday/i // événements ignorés (rappels d'anniversaire…), quel que soit l'agenda
+};
+var TF_TABLES = {
+  clients: ['id', 'nom', 'email', 'token', 'actif', 'creeLe', 'mensuel'],
+  demandes: ['id', 'clientId', 'jours', 'formation', 'theorie', 'pratique', 'type', 'lieu', 'remarque', 'statut', 'creeLe', 'majLe', 'eventId', 'sync',
+    'test', 'stagiaires', 'public', 'categories', 'contactSite', 'expireLe', 'source', 'rappelLe', 'recycleLe', 'remplace', 'rappelFormation', 'horaires', 'histo'],
+  blocages: ['id', 'jours', 'motif'],
+  agenda: ['jour'],
+  ouverts: ['jour'],
+  attentes: ['clientId', 'jour', 'creeLe'],
+  notes: ['jour', 'texte', 'majLe'],
+  bilans: ['jour', 'prix', 'stagiaires', 'texte', 'majLe'],
+  evenements: ['k', 'cal', 'titre', 'debut', 'fin', 'tout', 'lieu', 'desc', 'bloque', 'rec', 'own'],
+  mails: ['id', 'to', 'replyTo', 'sujet', 'html', 'statut', 'date']
+};
+var TF_BOOL = { actif: 1, theorie: 1, pratique: 1, test: 1, tout: 1, bloque: 1, rec: 1, own: 1 }, TF_LIST = { jours: 1 };
+
+function installer() {
+  var P = PropertiesService.getScriptProperties(), ss;
+  if (P.getProperty('SS_ID')) ss = SpreadsheetApp.openById(P.getProperty('SS_ID'));
+  else { ss = SpreadsheetApp.create('Torres Formation — Agenda (données)'); P.setProperty('SS_ID', ss.getId()); }
+  P.deleteProperty('SCHEMA'); tfEnsureSchema_(ss, P);
+  if (!P.getProperty('ADMIN_KEY')) P.setProperty('ADMIN_KEY', tfToken_() + tfToken_());
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'tfSync') ScriptApp.deleteTrigger(t); });
+  ScriptApp.newTrigger('tfSync').timeBased().everyMinutes(15).create();
+  CalendarApp.getDefaultCalendar().getName(); MailApp.getRemainingDailyQuota();
+  tfSync();
+  Logger.log('Installation terminée. Déployez maintenant l\'application Web.');
+}
+
+/* Crée / met à niveau les feuilles de données (ajoute les nouvelles colonnes sans toucher aux données) */
+function tfEnsureSchema_(ss, P) {
+  if (P.getProperty('SCHEMA') === '7') return;
+  Object.keys(TF_TABLES).forEach(function (n) {
+    var cols = TF_TABLES[n], sh = ss.getSheetByName(n) || ss.insertSheet(n);
+    if (sh.getMaxColumns() < cols.length) sh.insertColumnsAfter(sh.getMaxColumns(), cols.length - sh.getMaxColumns());
+    sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).setNumberFormat('@');
+    sh.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold'); sh.setFrozenRows(1);
+  });
+  var d = ss.getSheetByName('Feuille 1') || ss.getSheetByName('Sheet1'); if (d && ss.getSheets().length > 1) ss.deleteSheet(d);
+  P.setProperty('SCHEMA', '7');
+}
+
+function doGet(e) {
+  var q = (e && e.parameter) || {}, t = HtmlService.createTemplateFromFile('Index');
+  t.boot = JSON.stringify({ key: String(q.admin || q.c || ''), mode: q.admin ? 'admin' : (q.c ? 'client' : 'none'), contact: TF_CONFIG.contact }).replace(/</g, '\\x3c');
+  return t.evaluate().setTitle('Torres Formation — Agenda').addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.DEFAULT);
+}
+
+/* Appelé par la page publique (GitHub Pages) */
+function doPost(e) {
+  var r = { a: '', k: '', p: {} }, out;
+  try { r = JSON.parse(e.postData.contents); } catch (x) { }
+  try { out = api(String(r.a || ''), String(r.k || ''), JSON.stringify(r.p || {})); }
+  catch (err) { out = JSON.stringify({ ok: false, error: 'Service momentanément indisponible, réessayez.' }); }
+  return ContentService.createTextOutput(out).setMimeType(ContentService.MimeType.JSON);
+}
+
+function api(action, key, json) {
+  var P = PropertiesService.getScriptProperties(), res;
+  var env = tfEnv_(P);
+  if (action === 'lienAdmin') { // envoi du lien formateur à sa propre adresse, au plus 1 fois / 10 min
+    var last = Number(P.getProperty('LAST_ADMIN_MAIL') || 0);
+    if (Date.now() - last < 600000) return JSON.stringify({ ok: true, data: {} });
+    P.setProperty('LAST_ADMIN_MAIL', String(Date.now()));
+  }
+  if (action === 'sante' || action === 'sauvegarder') { // contrôle de santé + sauvegarde immédiate (formateur seulement)
+    if (String(key) !== env.adminKey) return JSON.stringify({ ok: false, error: 'Accès refusé.' });
+    if (action === 'sauvegarder') { var lk = LockService.getScriptLock(); lk.waitLock(25000); try { P.deleteProperty('BACKUP_DAY'); tfBackup_(SpreadsheetApp.openById(P.getProperty('SS_ID')), P); } catch (x) { P.setProperty('BACKUP_ERROR', String(x && x.message || x)); } finally { lk.releaseLock(); } }
+    return JSON.stringify({ ok: true, data: tfSante_(P, env) });
+  }
+  if (action === 'sync') { if (String(key) !== env.adminKey) return JSON.stringify({ ok: false, error: 'Accès refusé.' }); tfSync(); action = 'init'; }
+  var evtMsg = '';
+  if (action === 'evtMaj' || action === 'evtCreer' || action === 'evtSuppr') { // modification directe de Google Agenda (formateur seulement)
+    if (String(key) !== env.adminKey) return JSON.stringify({ ok: false, error: 'Accès refusé.' });
+    try { evtMsg = tfEvt_(action, JSON.parse(json || '{}')); } catch (x) { return JSON.stringify({ ok: false, error: String(x && x.message || x) }); }
+    tfSync(); action = 'init';
+  }
+  var lock = LockService.getScriptLock(), write = action !== 'init';
+  if (write) lock.waitLock(25000);
+  try {
+    var ss = SpreadsheetApp.openById(P.getProperty('SS_ID'));
+    tfEnsureSchema_(ss, P);
+    var db = tfLoad_(ss, P);
+    res = tfApi(db, env, action, key, JSON.parse(json || '{}'));
+    if (res.ok) {
+      Object.keys(res.dirty || {}).forEach(function (n) { tfSave_(ss, n, n === 'ouverts' ? db.ouverts.map(function (j) { return { jour: j }; }) : db[n]); });
+      if (res.mails && res.mails.length) tfQueueMails_(ss, res.mails);
+    }
+  } finally { if (write) { SpreadsheetApp.flush(); lock.releaseLock(); } }
+  if (res.ok && res.sync) { tfSync(); var r2 = tfApi(tfLoad_(SpreadsheetApp.openById(P.getProperty('SS_ID')), P), env, 'init', key, {}); if (r2.ok) { r2.data.msg = res.data.msg; res.data = r2.data; } }
+  else if (res.ok && res.mails && res.mails.length) { try { tfFlushMails_(); } catch (err) { } }
+  if (res.ok && evtMsg) res.data.msg = evtMsg;
+  if (res.ok && action === 'mensuel' && res.data && res.data.envoyes !== undefined && JSON.parse(json || '{}').mode === 'envoi') P.setProperty('LAST_MENSUEL', JSON.parse(json || '{}').ym || env.today.slice(0, 7));
+  return JSON.stringify(res.ok ? { ok: true, data: res.data } : { ok: false, error: res.error });
+}
+
+function tfEnv_(P) {
+  var now = new Date();
+  return { today: Utilities.formatDate(now, TF_CONFIG.tz, 'yyyy-MM-dd'), now: now.toISOString(), minDelai: TF_CONFIG.minDelai, horizon: TF_CONFIG.horizon,
+    adminKey: P.getProperty('ADMIN_KEY') || '', adminEmail: Session.getEffectiveUser().getEmail(), baseUrl: TF_CONFIG.pagesUrl || ScriptApp.getService().getUrl(),
+    contact: TF_CONFIG.contact, uid: function () { return Utilities.getUuid().replace(/-/g, '').slice(0, 12); }, token: function () { return tfToken_(10); } };
+}
+function tfToken_(len) {
+  var a = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789', s = '';
+  var b = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, Utilities.getUuid() + Math.random() + Date.now());
+  for (var i = 0; i < (len || 24); i++) s += a.charAt((b[i] & 255) % a.length);
+  return s;
+}
+function tfRead_(ss, n) {
+  var sh = ss.getSheetByName(n), cols = TF_TABLES[n], v = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, cols.length).getDisplayValues() : [];
+  return v.filter(function (r) { return r[0] !== ''; }).map(function (r) {
+    var o = {}; cols.forEach(function (c, i) { o[c] = TF_BOOL[c] ? r[i] === '1' : TF_LIST[c] ? (r[i] ? r[i].split(',') : []) : r[i]; }); return o;
+  });
+}
+function tfSave_(ss, n, rows) {
+  var sh = ss.getSheetByName(n), cols = TF_TABLES[n];
+  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, cols.length).clearContent();
+  if (!rows.length) return;
+  var v = rows.map(function (o) { return cols.map(function (c) { var x = o[c]; return TF_BOOL[c] ? (x ? '1' : '0') : TF_LIST[c] ? (x || []).join(',') : String(x == null ? '' : x); }); });
+  sh.getRange(2, 1, v.length, cols.length).setNumberFormat('@').setValues(v);
+}
+function tfLoad_(ss, P) {
+  return { clients: tfRead_(ss, 'clients'), demandes: tfRead_(ss, 'demandes'), blocages: tfRead_(ss, 'blocages'),
+    busy: tfRead_(ss, 'agenda').map(function (r) { return r.jour; }), notes: tfRead_(ss, 'notes'), bilans: tfRead_(ss, 'bilans'), attentes: tfRead_(ss, 'attentes'), evenements: tfRead_(ss, 'evenements'), ouverts: tfRead_(ss, 'ouverts').map(function (r) { return r.jour; }),
+    meta: { lastSync: P.getProperty('LAST_SYNC') || '', syncError: P.getProperty('SYNC_ERROR') || '', agendas: P.getProperty('AGENDAS') || '', backup: P.getProperty('LAST_BACKUP') || '', mensuel: P.getProperty('LAST_MENSUEL') || '' } };
+}
+
+/* ---------- Synchronisation Google Agenda (toutes les 15 min + après chaque validation) ----------
+   - Écrit les formations validées dans l'agenda du compte pro.
+   - Lit TOUS les agendas du compte (pro + agendas perso partagés) : un événement « occupé » rend le jour
+     indisponible pour les clients, sans jamais montrer le titre.
+   - Maintenance : options expirées libérées, rappels, recyclage, demandes passées.
+   Si Google Agenda ne répond pas : l'agenda continue sur le dernier calendrier connu et les opérations
+   en attente sont rejouées automatiquement au passage suivant. */
+function tfSync() {
+  var P = PropertiesService.getScriptProperties(), lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return;
+  try {
+    var ss = SpreadsheetApp.openById(P.getProperty('SS_ID')), cal = CalendarApp.getDefaultCalendar();
+    tfEnsureSchema_(ss, P);
+    try { tfBackup_(ss, P); } catch (x) { P.setProperty('BACKUP_ERROR', String(x && x.message || x)); }
+    try { // maintenance automatique (options expirées, rappels…)
+      var env = tfEnv_(P), mdb = tfLoad_(ss, P), m = tfApi(mdb, env, 'maintenance', env.adminKey, {});
+      if (m.ok) { if (m.dirty.demandes) tfSave_(ss, 'demandes', mdb.demandes); if (m.dirty.attentes) tfSave_(ss, 'attentes', mdb.attentes); if (m.mails.length) tfQueueMails_(ss, m.mails); }
+    } catch (x) { }
+    var dem = tfRead_(ss, 'demandes'), clients = tfRead_(ss, 'clients'), changed = false, err = '';
+    function d0(s) { var a = s.split('-'); return new Date(Number(a[0]), Number(a[1]) - 1, Number(a[2])); }
+    dem.forEach(function (d) {
+      try {
+        if (d.sync === 'A_FAIRE') {
+          var nom = '—'; clients.forEach(function (c) { if (c.id === d.clientId) nom = c.nom; });
+          var ids = [], a = d.jours.slice().sort(), i = 0;
+          var pres = d.test && !d.theorie && !d.pratique ? 'Test' : d.test ? 'Formation + test' : 'Formation';
+          var desc = [d.formation, [d.theorie ? 'Théorie' : '', d.pratique ? 'Pratique' : '', d.test ? 'Test' : ''].filter(String).join(' + '),
+            d.categories ? 'Catégories : ' + d.categories.split(',').join(', ') : '', Number(d.stagiaires) ? 'Stagiaires : ' + d.stagiaires : '',
+            d.lieu ? 'Lieu : ' + d.lieu : '', d.horaires ? 'Horaires : ' + d.horaires.replace('-', ' – ') : '', d.contactSite ? 'Contact sur place : ' + d.contactSite : '', d.remarque].filter(String).join('\n');
+          while (i < a.length) {
+            var j = i; while (j + 1 < a.length && tfAddDays(a[j], 1) === a[j + 1]) j++;
+            var ev = cal.createAllDayEvent(pres + ' ' + d.formation.split(' — ')[0] + ' — ' + nom, d0(a[i]), d0(tfAddDays(a[j], 1)), { description: desc, location: d.lieu || '' });
+            ev.setTag('tf', d.id); try { ev.setTransparency(CalendarApp.EventTransparency.OPAQUE); } catch (x) { }
+            ids.push(ev.getId()); i = j + 1;
+          }
+          d.eventId = ids.join('|'); d.sync = 'OK'; changed = true;
+        } else if (d.sync === 'A_SUPPRIMER') {
+          (d.eventId || '').split('|').filter(String).forEach(function (id) { var ev = cal.getEventById(id); if (ev) ev.deleteEvent(); });
+          d.eventId = ''; d.sync = 'OK'; changed = true;
+        }
+      } catch (e) { err = String(e && e.message || e); }
+    });
+    var keep = dem.filter(function (d) { return !(d.statut === 'SUPPRIMEE' && d.sync !== 'A_SUPPRIMER'); }); // entreprises supprimées : on purge
+    if (keep.length !== dem.length) { dem = keep; changed = true; }
+    if (changed) tfSave_(ss, 'demandes', dem);
+
+    var now = new Date(), fin = new Date(now.getTime() + (TF_CONFIG.horizon + 2) * 86400000), busy = {}, tz = TF_CONFIG.tz, used = [], cals = [], evts = [];
+    try { cals = CalendarApp.getAllCalendars(); } catch (e) { cals = [cal]; }
+    cals.forEach(function (c) {
+      var nm = ''; try { nm = c.getName() || ''; } catch (x) { }
+      if (TF_CONFIG.ignorer.test(nm)) return;
+      try {
+        c.getEvents(new Date(now.getTime() - 60 * 86400000), fin).forEach(function (ev) {
+          if (ev.getTag('tf')) return;
+          try { if (TF_CONFIG.ignorerEvt.test(ev.getTitle() || '')) return; } catch (x) { }
+          try { if (ev.getMyStatus() === CalendarApp.GuestStatus.NO) return; } catch (x) { }
+          var blk = true; // une journée entière bloque toujours (Google la marque « disponible » par défaut)
+          try { if (!ev.isAllDayEvent() && ev.getTransparency() === CalendarApp.EventTransparency.TRANSPARENT) blk = false; } catch (x) { }
+          try { var rec = tfEvtRec_(ev, c, nm, blk); if (rec) evts.push(rec); } catch (x) { }
+          if (!blk) return;
+          if (ev.isAllDayEvent()) {
+            var s = Utilities.formatDate(ev.getAllDayStartDate(), Session.getScriptTimeZone(), 'yyyy-MM-dd'), e = Utilities.formatDate(ev.getAllDayEndDate(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+            for (var x = s, n = 0; x < e && n < 400; x = tfAddDays(x, 1), n++) busy[x] = 1;
+          } else {
+            var S = Utilities.formatDate(ev.getStartTime(), tz, 'yyyy-MM-dd HH:mm'), E = Utilities.formatDate(ev.getEndTime(), tz, 'yyyy-MM-dd HH:mm');
+            for (var y = S.slice(0, 10), k = 0; y <= E.slice(0, 10) && k < 400; y = tfAddDays(y, 1), k++)
+              if (S < y + ' ' + TF_CONFIG.heureFin && E > y + ' ' + TF_CONFIG.heureDebut) busy[y] = 1;
+          }
+        });
+        used.push(nm);
+      } catch (e) { err = String(e && e.message || e); }
+    });
+    tfSave_(ss, 'agenda', Object.keys(busy).sort().map(function (j) { return { jour: j }; }));
+    if (!err) { evts.sort(function (a, b) { return a.debut < b.debut ? -1 : a.debut > b.debut ? 1 : 0; }); tfSave_(ss, 'evenements', evts.slice(0, 2500)); }
+    try { tfAlertes_(P, dem, clients, evts); } catch (x) { }
+    P.setProperty('AGENDAS', used.join(' · '));
+    P.setProperty('LAST_SYNC', new Date().toISOString()); P.setProperty('SYNC_ERROR', err);
+  } catch (e) {
+    P.setProperty('SYNC_ERROR', String(e && e.message || e));
+  } finally { SpreadsheetApp.flush(); lock.releaseLock(); }
+  try { tfAuto_(P); } catch (e) { P.setProperty('AUTO_ERROR', String(e && e.message || e)); }
+  try { tfFlushMails_(); } catch (e) { }
+}
+
+/* ---------- Événements Google : fiche détaillée (formateur seulement, jamais montrée aux clients) ---------- */
+function tfEvtRec_(ev, c, nm, blk) {
+  var tz = TF_CONFIG.tz, ad = ev.isAllDayEvent(), st = ev.getStartTime(), o = { k: c.getId() + '|' + ev.getId() + '|' + st.toISOString(), cal: nm, titre: ev.getTitle() || '(sans titre)', tout: ad,
+    lieu: ev.getLocation() || '', desc: String(ev.getDescription() || '').slice(0, 1500), bloque: blk, rec: false, own: false };
+  try { o.rec = ev.isRecurringEvent(); } catch (x) { }
+  try { o.own = c.isOwnedByMe(); } catch (x) { }
+  if (ad) {
+    var s = Utilities.formatDate(ev.getAllDayStartDate(), Session.getScriptTimeZone(), 'yyyy-MM-dd'), e = Utilities.formatDate(ev.getAllDayEndDate(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    o.debut = s; o.fin = e > s ? tfAddDays(e, -1) : s;
+  } else { o.debut = Utilities.formatDate(st, tz, 'yyyy-MM-dd HH:mm'); o.fin = Utilities.formatDate(ev.getEndTime(), tz, 'yyyy-MM-dd HH:mm'); }
+  return o;
+}
+function tfD0_(s) { var a = s.split('-'); return new Date(Number(a[0]), Number(a[1]) - 1, Number(a[2])); }
+function tfEvtFind_(k) {
+  var a = String(k || '').split('|'); if (a.length < 3) throw new Error('Événement introuvable.');
+  var cal = CalendarApp.getCalendarById(a[0]); if (!cal) throw new Error('Agenda introuvable.');
+  var t = new Date(a[2]).getTime(), f = null;
+  cal.getEvents(new Date(t - 3600000), new Date(t + 3600000)).forEach(function (e) { if (!f && e.getId() === a[1] && Math.abs(e.getStartTime().getTime() - t) < 60000) f = e; });
+  if (!f) throw new Error('Cet événement a été modifié dans Google Agenda. La liste vient d\'être actualisée, réessayez.');
+  return f;
+}
+function tfEvt_(action, p) {
+  var titre = String(p.titre || '').replace(/\s+/g, ' ').trim().slice(0, 200), lieu = String(p.lieu || '').trim().slice(0, 200), desc = String(p.desc == null ? '' : p.desc).replace(/\r/g, '').slice(0, 4000);
+  if (action !== 'evtSuppr' && !titre) throw new Error('Donnez un titre à l\'événement.');
+  var fin = '', jour = String(p.jour || '');
+  if (action !== 'evtSuppr' && (action === 'evtCreer' || p.tps)) {
+    if (!tfIsDay(jour)) throw new Error('Date de début invalide.');
+    fin = tfIsDay(p.jourFin) ? p.jourFin : jour; if (fin < jour) throw new Error('La date de fin est avant la date de début.');
+    if (!p.tout) {
+      if (!/^\d{2}:\d{2}$/.test(p.hd || '') || !/^\d{2}:\d{2}$/.test(p.hf || '')) throw new Error('Indiquez les heures de début et de fin.');
+      if (fin + ' ' + p.hf <= jour + ' ' + p.hd) throw new Error('L\'heure de fin doit être après l\'heure de début.');
+    }
+  }
+  function dt(j, h) { return Utilities.parseDate(j + ' ' + h, TF_CONFIG.tz, 'yyyy-MM-dd HH:mm'); }
+  try {
+    if (action === 'evtCreer') {
+      var cal = CalendarApp.getDefaultCalendar(), ev;
+      if (p.tout) ev = cal.createAllDayEvent(titre, tfD0_(jour), tfD0_(tfAddDays(fin, 1)), { description: desc, location: lieu });
+      else ev = cal.createEvent(titre, dt(jour, p.hd), dt(fin, p.hf), { description: desc, location: lieu });
+      try { ev.setTransparency(CalendarApp.EventTransparency.OPAQUE); } catch (x) { }
+      return 'Événement ajouté à Google Agenda';
+    }
+    var e = tfEvtFind_(p.k);
+    if (action === 'evtSuppr') { e.deleteEvent(); return 'Événement supprimé de Google Agenda'; }
+    e.setTitle(titre); e.setLocation(lieu); e.setDescription(desc);
+    if (p.tps) { if (p.tout) e.setAllDayDates(tfD0_(jour), tfD0_(tfAddDays(fin, 1))); else e.setTime(dt(jour, p.hd), dt(fin, p.hf)); }
+    return 'Modifié dans Google Agenda';
+  } catch (x) {
+    var m = String(x && x.message || x);
+    if (/Accès refusé|permission|autorisation|not (have|allowed)|read.?only|forbidden/i.test(m)) throw new Error('Google refuse la modification : cet agenda est en lecture seule. Partagez-le avec le droit « Apporter des modifications aux événements ».');
+    throw new Error(m);
+  }
+}
+
+/* ---------- Alerte : un nouvel événement Google tombe sur une formation validée ---------- */
+function tfAlertes_(P, dem, clients, evts) {
+  var today = Utilities.formatDate(new Date(), TF_CONFIG.tz, 'yyyy-MM-dd'), cur = {}, lines = [], first = P.getProperty('ALERTES') === null;
+  var seen = {}; try { (JSON.parse(P.getProperty('ALERTES') || '[]')).forEach(function (k) { seen[k] = 1; }); } catch (x) { }
+  dem.forEach(function (d) {
+    if (d.statut !== 'VALIDEE') return;
+    evts.forEach(function (e) {
+      if (!e.bloque) return;
+      var a = e.debut.slice(0, 10), b = e.fin.slice(0, 10), hit = null;
+      d.jours.forEach(function (j) { if (j >= today && j >= a && j <= b && !hit) hit = j; });
+      if (!hit) return;
+      var key = d.id + '|' + e.k; cur[key] = 1;
+      if (!seen[key] && !first) { var nom = '—'; clients.forEach(function (c) { if (c.id === d.clientId) nom = c.nom; }); lines.push('« ' + e.titre + ' » (' + e.cal + ') le ' + tfFmtJours([hit]) + ' — formation ' + d.formation + ' chez ' + nom); }
+    });
+  });
+  if (lines.length) {
+    var env = tfEnv_(P), ss = SpreadsheetApp.openById(P.getProperty('SS_ID'));
+    tfQueueMails_(ss, [{ to: env.adminEmail, sujet: 'Conflit d\'agenda détecté', titre: 'Conflit d\'agenda', lignes: ['Un événement Google Agenda vient d\'être ajouté sur une formation déjà validée :'].concat(lines).concat(['Ouvrez votre espace pour déplacer ou ajuster l\'un des deux.']), lien: { label: 'Ouvrir mon espace formateur', url: env.baseUrl + '?admin=' + env.adminKey } }]);
+  }
+  P.setProperty('ALERTES', JSON.stringify(Object.keys(cur).slice(-400)));
+}
+
+/* ---------- Tâches automatiques : e-mail mensuel le 1er, résumé du lundi (à partir de 7 h) ---------- */
+function tfAuto_(P) {
+  var now = new Date(), tz = TF_CONFIG.tz;
+  if (Number(Utilities.formatDate(now, tz, 'H')) < 7) return;
+  var today = Utilities.formatDate(now, tz, 'yyyy-MM-dd'), ym = today.slice(0, 7), dom = Number(today.slice(8, 10)), dow = Number(Utilities.formatDate(now, tz, 'u'));
+  var needM = dom === 1 && P.getProperty('LAST_MENSUEL') !== ym, needD = dow === 1 && P.getProperty('LAST_DIGEST') !== today;
+  if (!needM && !needD) return;
+  var lock = LockService.getScriptLock(); if (!lock.tryLock(20000)) return;
+  try {
+    var ss = SpreadsheetApp.openById(P.getProperty('SS_ID')), env = tfEnv_(P), db = tfLoad_(ss, P), r;
+    if (needM) { r = tfApi(db, env, 'mensuel', env.adminKey, { mode: 'envoi', ym: ym }); if (r.ok) { if (r.mails.length) tfQueueMails_(ss, r.mails); P.setProperty('LAST_MENSUEL', ym); P.setProperty('LAST_MENSUEL_N', String(r.mails.length)); } }
+    if (needD) { r = tfApi(db, env, 'digest', env.adminKey, {}); if (r.ok) { if (r.mails.length) tfQueueMails_(ss, r.mails); P.setProperty('LAST_DIGEST', today); } }
+  } finally { lock.releaseLock(); }
+}
+
+/* ---------- Sauvegarde quotidienne (dans votre Drive : classeur « Sauvegardes agenda », 14 derniers jours) ----------
+   Copie clients, demandes, blocages et jours ouverts. Ne touche jamais aux données d'origine. */
+function tfBackup_(ss, P) {
+  var day = Utilities.formatDate(new Date(), TF_CONFIG.tz, 'yyyy-MM-dd');
+  if (P.getProperty('BACKUP_DAY') === day) return;
+  var id = P.getProperty('BACKUP_SS_ID'), bk = null;
+  if (id) { try { bk = SpreadsheetApp.openById(id); } catch (e) { bk = null; } }
+  if (!bk) { bk = SpreadsheetApp.create('Torres Formation — Sauvegardes agenda (ne pas supprimer)'); P.setProperty('BACKUP_SS_ID', bk.getId()); }
+  ['clients', 'demandes', 'blocages', 'ouverts', 'notes', 'bilans', 'attentes'].forEach(function (n) {
+    var src = ss.getSheetByName(n); if (!src) return;
+    var nm = day + ' · ' + n, old = bk.getSheetByName(nm);
+    if (old) bk.deleteSheet(old);
+    src.copyTo(bk).setName(nm);
+  });
+  var lim = Utilities.formatDate(new Date(Date.now() - 14 * 86400000), TF_CONFIG.tz, 'yyyy-MM-dd');
+  bk.getSheets().forEach(function (sh) {
+    var m = sh.getName().match(/^(\d{4}-\d{2}-\d{2}) · /);
+    if (m && m[1] < lim) bk.deleteSheet(sh);
+  });
+  bk.getSheets().forEach(function (sh) { if (/^(Sheet1|Feuille 1)$/.test(sh.getName()) && bk.getSheets().length > 1) bk.deleteSheet(sh); });
+  P.setProperty('BACKUP_DAY', day); P.setProperty('LAST_BACKUP', new Date().toISOString()); P.deleteProperty('BACKUP_ERROR');
+}
+
+/* ---------- Contrôle de santé : chaque lien client actif répond-il ? (à lancer après chaque mise à jour) ---------- */
+function tfSante_(P, env) {
+  var ss = SpreadsheetApp.openById(P.getProperty('SS_ID'));
+  tfEnsureSchema_(ss, P);
+  var db = tfLoad_(ss, P), ko = [], ok = 0, actifs = 0;
+  db.clients.forEach(function (c) {
+    if (!c.actif) return;
+    actifs++;
+    var r; try { r = tfApi(db, env, 'init', c.token, {}); } catch (e) { r = { ok: false }; }
+    if (r.ok && r.data && r.data.role === 'client') ok++; else ko.push(c.nom);
+  });
+  var adm; try { adm = tfApi(db, env, 'init', env.adminKey, {}); } catch (e) { adm = { ok: false }; }
+  return { version: TF_VERSION, schema: P.getProperty('SCHEMA') || '', clients: db.clients.length, actifs: actifs, liensOk: ok, liensKo: ko,
+    admin: !!(adm.ok && adm.data && adm.data.role === 'admin'), demandes: db.demandes.length, backup: P.getProperty('LAST_BACKUP') || '',
+    backupErreur: P.getProperty('BACKUP_ERROR') || '', mensuel: P.getProperty('LAST_MENSUEL') || '', digest: P.getProperty('LAST_DIGEST') || '', autoErreur: P.getProperty('AUTO_ERROR') || '', lastSync: db.meta.lastSync, syncError: db.meta.syncError };
+}
+
+/* ---------- E-mails (file d'attente : rien n'est perdu si l'envoi échoue) ---------- */
+function tfEsc_(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function tfMailHtml_(m) {
+  var c = TF_CONFIG.contact, f = "font-family:'Barlow',Arial,Helvetica,sans-serif;";
+  return '<div style="background:#EDEAE4;padding:24px 12px;' + f + '"><div style="max-width:520px;margin:0 auto;background:#FFFFFF;">' +
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0B0B0C;border-bottom:2px solid #C22A22;"><tr><td style="padding:20px 28px;"><div style="color:#EDEAE4;font-size:20px;font-weight:700;letter-spacing:5px;">TORRES</div><div style="color:#A9A59E;font-size:11px;letter-spacing:7px;">FORMATION</div></td><td align="right" style="padding:14px 28px 14px 0;"><img src="' + TF_CONFIG.pagesUrl + 'logo-mail.png" width="49" height="60" alt="" style="display:block;border:0;"></td></tr></table>' +
+    '<div style="padding:28px;color:#0B0B0C;"><div style="font-size:20px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:16px;">' + tfEsc_(m.titre) + '</div>' +
+    m.lignes.map(function (l) { return '<p style="margin:0 0 10px;font-size:15px;line-height:1.5;color:#17171A;">' + tfEsc_(l).replace(/\n/g, '<br>') + '</p>'; }).join('') + (m.bloc || '') +
+    (m.lien ? '<p style="margin:24px 0 4px;"><a href="' + tfEsc_(m.lien.url) + '" style="display:inline-block;background:#0B0B0C;color:#EDEAE4;text-decoration:none;padding:13px 22px;font-size:14px;font-weight:700;letter-spacing:2px;text-transform:uppercase;">' + tfEsc_(m.lien.label) + '</a></p>' : '') +
+    (m.actions ? '<p style="margin:14px 0 4px;font-size:13px;color:#6E6B66;">En un geste :</p><p style="margin:0;">' + m.actions.map(function (a) { return '<a href="' + tfEsc_(a.url) + '" style="display:inline-block;margin:0 8px 8px 0;border:1px solid #0B0B0C;color:#0B0B0C;text-decoration:none;padding:9px 14px;font-size:13px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">' + tfEsc_(a.label) + '</a>'; }).join('') + '</p>' : '') +
+    (m.fin ? '<div style="margin-top:22px;">' + m.fin.map(function (l, i) { return '<p style="margin:0 0 4px;font-size:15px;line-height:1.5;color:#17171A;' + (i ? 'font-weight:700;' : '') + '">' + tfEsc_(l) + '</p>'; }).join('') + '</div>' : '') +
+    '</div><div style="padding:0 28px 18px;"><img src="' + TF_CONFIG.pagesUrl + 'banniere-mail.png" width="464" height="116" alt="Torres Formation — Manutention · Levage · Élingage — Formation &amp; tests CACES · AIPR" style="display:block;border:0;width:100%;max-width:464px;height:auto;"></div><div style="padding:18px 28px;border-top:1px solid #EDEAE4;color:#6E6B66;font-size:12px;line-height:1.6;">' + tfEsc_(c.nom) + ' — Torres Formation<br>' + tfEsc_(c.tel) + ' · ' + tfEsc_(c.email) + '<br>CACES · AIPR · Élingage — ' + tfEsc_(c.zone) + (m.pied ? '<br><br>' + m.pied : '') + '</div></div></div>';
+}
+function tfQueueMails_(ss, mails) {
+  var sh = ss.getSheetByName('mails'), now = new Date().toISOString();
+  var v = mails.filter(function (m) { return m.to; }).map(function (m) { return [Utilities.getUuid().slice(0, 8), m.to, m.replyTo || '', 'Torres Formation — ' + m.sujet, tfMailHtml_(m), 'A_ENVOYER', now]; });
+  if (v.length) sh.getRange(sh.getLastRow() + 1, 1, v.length, 7).setNumberFormat('@').setValues(v);
+}
+function tfFlushMails_() {
+  var lock = LockService.getScriptLock(); if (!lock.tryLock(10000)) return;
+  try {
+    var ss = SpreadsheetApp.openById(PropertiesService.getScriptProperties().getProperty('SS_ID')), sh = ss.getSheetByName('mails');
+    if (sh.getLastRow() < 2) return;
+    var rg = sh.getRange(2, 1, sh.getLastRow() - 1, 7), v = rg.getValues();
+    v.forEach(function (r, i) {
+      if (r[5] !== 'A_ENVOYER') return;
+      var o = { to: r[1], subject: r[3], htmlBody: r[4], name: 'Torres Formation' }; if (r[2]) o.replyTo = r[2];
+      MailApp.sendEmail(o); sh.getRange(i + 2, 6).setValue('ENVOYE');
+    });
+    if (sh.getLastRow() > 400) sh.deleteRows(2, sh.getLastRow() - 300);
+  } finally { lock.releaseLock(); }
+}
+
+var TF_VERSION = '2.4', TF_FRONT_MIN = 4; // TF_FRONT_MIN : version minimale de la page ; si elle augmente, les pages ouvertes se rechargent seules
+/* ===== TORRES FORMATION — Agenda de réservation : logique métier (pure) ===== */
+var TF_FORMATIONS = [
+  'CACES R482 — Engins de chantier',
+  'CACES R485 — Chariots gerbeurs',
+  'CACES R486 — PEMP / Nacelles',
+  'CACES R489 — Chariots élévateurs',
+  'CACES R490 — Grues de chargement',
+  'AIPR',
+  'Élingage',
+  'Autre (à préciser en remarque)'
+];
+/* Formations pour lesquelles Torres Formation fait aussi passer le test (testeur) */
+var TF_TEST = { 'CACES R489 — Chariots élévateurs': 1, 'CACES R490 — Grues de chargement': 1 };
+/* Catégories réellement dispensées */
+var TF_CATS = {
+  'CACES R482 — Engins de chantier': ['A OT', 'B1', 'C1', 'F', 'G'],
+  'CACES R485 — Chariots gerbeurs': ['1', '2'],
+  'CACES R486 — PEMP / Nacelles': ['A', 'B'],
+  'CACES R489 — Chariots élévateurs': ['1A', '1B', '3', '5', '6'],
+  'CACES R490 — Grues de chargement': ['OT'],
+  'AIPR': ['Opérateur', 'Encadrant', 'Concepteur']
+};
+var TF_PUBLICS = { INITIAL: 'Formation initiale', RECYCLAGE: 'Recyclage', MIXTE: 'Initial et recyclage' };
+
+function tfAddDays(s, n) { var d = new Date(s + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+function tfIsDay(s) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  var d = new Date(s + 'T12:00:00Z'); return !isNaN(d) && d.toISOString().slice(0, 10) === s;
+}
+function tfStr(v, max) { return String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, max); }
+function tfFmtJours(jours) {
+  var J = ['dim.', 'lun.', 'mar.', 'mer.', 'jeu.', 'ven.', 'sam.'];
+  var M = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
+  function f(s) { var d = new Date(s + 'T12:00:00Z'); return J[d.getUTCDay()] + ' ' + d.getUTCDate() + ' ' + M[d.getUTCMonth()] + ' ' + d.getUTCFullYear(); }
+  var a = jours.slice().sort(), out = [], i = 0;
+  while (i < a.length) {
+    var j = i; while (j + 1 < a.length && tfAddDays(a[j], 1) === a[j + 1]) j++;
+    out.push(j > i ? 'du ' + f(a[i]) + ' au ' + f(a[j]) : f(a[i])); i = j + 1;
+  }
+  return out.join(', ');
+}
+function tfEscH(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+var TF_JOURS_LONG = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+var TF_MOIS_LONG = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+/* « lundi 7 décembre » ou « du lundi 7 au vendredi 11 décembre » */
+function tfFmtPlage(a, b) {
+  var da = new Date(a + 'T12:00:00Z'), db = new Date(b + 'T12:00:00Z');
+  function f(d, mois) { return TF_JOURS_LONG[d.getUTCDay()] + ' ' + (d.getUTCDate() === 1 ? '1er' : d.getUTCDate()) + (mois ? ' ' + TF_MOIS_LONG[d.getUTCMonth()] : ''); }
+  if (a === b) return f(da, true);
+  return 'du ' + f(da, false) + ' au ' + f(db, true);
+}
+/* ---- week-ends et jours fériés (France métropolitaine) ---- */
+function tfWeekend(s) { var w = new Date(s + 'T12:00:00Z').getUTCDay(); return w === 0 || w === 6; }
+function tfPaques(y) {
+  var a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3),
+    h = (19 * a + b - d - g + 15) % 30, i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451),
+    mo = Math.floor((h + l - 7 * m + 114) / 31), da = ((h + l - 7 * m + 114) % 31) + 1;
+  return y + '-' + (mo < 10 ? '0' : '') + mo + '-' + (da < 10 ? '0' : '') + da;
+}
+function tfFeries(d1, d2) {
+  var o = {};
+  for (var y = +d1.slice(0, 4); y <= +d2.slice(0, 4); y++) {
+    var p = tfPaques(y);
+    o[y + '-01-01'] = 'Jour de l\'An'; o[tfAddDays(p, 1)] = 'Lundi de Pâques'; o[y + '-05-01'] = 'Fête du Travail'; o[y + '-05-08'] = 'Victoire 1945';
+    o[tfAddDays(p, 39)] = 'Ascension'; o[tfAddDays(p, 50)] = 'Lundi de Pentecôte'; o[y + '-07-14'] = 'Fête nationale'; o[y + '-08-15'] = 'Assomption';
+    o[y + '-11-01'] = 'Toussaint'; o[y + '-11-11'] = 'Armistice'; o[y + '-12-25'] = 'Noël';
+  }
+  return o;
+}
+
+/* Après une action qui libère des dates : prévient les entreprises qui ont demandé une alerte sur ces dates */
+function tfApi(db, env, action, key, p) {
+  var o = tfApi0(db, env, action, key, p);
+  if (o.ok && action !== 'init' && action !== '__attentes' && (db.attentes || []).length && (o.dirty.demandes || o.dirty.blocages || action === 'maintenance')) {
+    var w = tfApi0(db, env, '__attentes', env.adminKey, {});
+    if (w.ok) { o.mails = o.mails.concat(w.mails); if (w.dirty.attentes) o.dirty.attentes = true; }
+  }
+  return o;
+}
+function tfApi0(db, env, action, key, p) {
+  var out = { ok: true, data: null, mails: [], dirty: {}, sync: false };
+  function fail(m) { var e = new Error(m); e.tf = true; throw e; }
+  try {
+    p = p || {};
+    if (action === 'lienAdmin') {
+      out.mails.push({ to: env.adminEmail, sujet: 'Votre lien d\'accès formateur', titre: 'Espace formateur',
+        lignes: ['Voici votre lien personnel d\'accès à l\'espace formateur de votre agenda.', 'Ne le transmettez à personne : il donne accès à toutes vos réservations.'],
+        lien: { label: 'Ouvrir mon espace formateur', url: env.baseUrl + '?admin=' + env.adminKey } });
+      out.data = {}; return out;
+    }
+    key = String(key || '');
+    var isAdmin = key.length >= 16 && key === env.adminKey;
+    var client = null;
+    if (!isAdmin) {
+      for (var i = 0; i < db.clients.length; i++) if (key.length >= 8 && db.clients[i].token === key && db.clients[i].actif) client = db.clients[i];
+      if (!client) fail('Ce lien n\'est pas valide ou a été désactivé. Contactez Torres Formation.');
+    }
+    db.ouverts = db.ouverts || []; db.attentes = db.attentes || [];
+    var optionJours = env.optionJours || 10;
+    var minDay = tfAddDays(env.today, env.minDelai), maxDay = tfAddDays(env.today, env.horizon);
+    var hard = {}, ouv = {}, feries = tfFeries(tfAddDays(env.today, -400), maxDay);
+    db.blocages.forEach(function (b) { b.jours.forEach(function (j) { hard[j] = 1; }); });
+    db.busy.forEach(function (j) { hard[j] = 1; });
+    db.ouverts.forEach(function (j) { ouv[j] = 1; });
+    function nat(j) { return tfWeekend(j) || !!feries[j]; } // week-end ou férié : réservable comme les autres jours, simplement non compté comme « jour ouvré »
+    function histo(d, t) { d.histo = ((d.histo || '') + env.now + '|' + t + '\n').slice(-1500); }
+    function rap0(d) { var j = d.jours[0]; return d.type !== 'OPTION' ? '' : j <= tfAddDays(env.today, 7) ? '7' : j <= tfAddDays(env.today, 14) ? '14' : ''; }
+    function actif(d) { return d.statut === 'ATTENTE' || d.statut === 'VALIDEE'; }
+    function clientNom(id) { for (var i = 0; i < db.clients.length; i++) if (db.clients[i].id === id) return db.clients[i].nom; return '—'; }
+    function clientById(id) { for (var i = 0; i < db.clients.length; i++) if (db.clients[i].id === id) return db.clients[i]; return null; }
+    function demById(id) { for (var i = 0; i < db.demandes.length; i++) if (db.demandes[i].id === id) return db.demandes[i]; return null; }
+    function findDem(id) { var d = demById(id); if (!d || d.statut === 'SUPPRIMEE') fail('Demande introuvable.'); return d; }
+    function partage(a, b) { for (var i = 0; i < a.jours.length; i++) if (b.jours.indexOf(a.jours[i]) >= 0) return true; return false; }
+    function rang(d) {
+      var avant = 0, total = 0;
+      db.demandes.forEach(function (o) { if (o.id !== d.id && o.statut === 'ATTENTE' && partage(d, o)) { total++; if (o.creeLe < d.creeLe) avant++; } });
+      return { rang: avant + 1, total: total + 1 };
+    }
+    function etatJour(jour, clientId) { // ce que voit un client donné : null = libre
+      if (hard[jour]) return { s: 'x' };
+      var opt = 0;
+      for (var i = 0; i < db.demandes.length; i++) {
+        var d = db.demandes[i];
+        if (!actif(d) || d.clientId === clientId || d.jours.indexOf(jour) < 0) continue;
+        if (d.statut === 'VALIDEE' || d.type === 'FERME') return { s: 'x' };
+        opt++;
+      }
+      return opt ? { s: 'o', q: opt } : null;
+    }
+    function nb(d) { return Number(d.stagiaires) || 0; }
+    function vueDem(d, admin) {
+      var r = d.statut === 'ATTENTE' ? rang(d) : { rang: 0, total: 0 };
+      var v = { id: d.id, jours: d.jours, formation: d.formation, theorie: d.theorie, pratique: d.pratique, test: !!d.test, type: d.type,
+        lieu: d.lieu, remarque: d.remarque, statut: d.statut, creeLe: d.creeLe, rang: r.rang, stagiaires: nb(d), public: d.public || '',
+        categories: d.categories || '', contactSite: d.contactSite || '', expireLe: '', remplace: d.remplace || '', source: d.source || 'CLIENT', horaires: d.horaires || '' };
+      if (d.remplace) { var old = demById(d.remplace); v.remplaceJours = old ? old.jours : []; }
+      if (admin) { v.total = r.total; v.clientId = d.clientId; v.client = clientNom(d.clientId); v.sync = d.sync; v.histo = d.histo || ''; }
+      return v;
+    }
+    function commun() {
+      return { today: env.today, minDay: minDay, maxDay: maxDay, formations: TF_FORMATIONS, cats: TF_CATS, tests: Object.keys(TF_TEST), publics: TF_PUBLICS,
+        feries: feries, ouverts: db.ouverts.slice(), optionJours: optionJours, contact: env.contact, lastSync: db.meta.lastSync || '', now: env.now, v: TF_VERSION, fv: TF_FRONT_MIN, tarif: env.tarif || 350 };
+    }
+    function initClient() {
+      var days = {}, cand = {};
+      Object.keys(hard).forEach(function (j) { cand[j] = 1; });
+      db.demandes.forEach(function (d) { if (actif(d) && d.clientId !== client.id) d.jours.forEach(function (j) { cand[j] = 1; }); });
+      Object.keys(cand).forEach(function (j) { if (j >= env.today && j <= maxDay) { var e = etatJour(j, client.id); if (e) days[j] = e; } });
+      var mine = db.demandes.filter(function (d) { return d.clientId === client.id && d.statut !== 'SUPPRIMEE'; })
+        .sort(function (a, b) { return a.creeLe < b.creeLe ? 1 : -1; }).slice(0, 100).map(function (d) { return vueDem(d, false); });
+      var r = commun(); r.role = 'client'; r.client = { nom: client.nom, mensuel: client.mensuel !== '0', email: !!client.email }; r.days = days; r.mine = mine;
+      r.attentes = db.attentes.filter(function (a) { return a.clientId === client.id && a.jour >= env.today; }).map(function (a) { return a.jour; }).sort(); return r;
+    }
+    function initAdmin() {
+      var r = commun(); r.role = 'admin';
+      r.demandes = db.demandes.filter(function (d) { return d.statut !== 'SUPPRIMEE'; }).sort(function (a, b) { return a.creeLe < b.creeLe ? -1 : 1; }).slice(-600).map(function (d) { return vueDem(d, true); });
+      r.clients = db.clients.map(function (c) { return { id: c.id, nom: c.nom, email: c.email, actif: c.actif, mensuel: c.mensuel !== '0', url: env.baseUrl + '?c=' + c.token }; });
+      r.notes = (db.notes || []).map(function (n) { return { jour: n.jour, texte: n.texte }; });
+      r.bilans = (db.bilans || []).map(function (b) { return { jour: b.jour, prix: b.prix === '' || b.prix == null ? null : Number(b.prix), stagiaires: b.stagiaires === '' || b.stagiaires == null ? null : Number(b.stagiaires), texte: b.texte || '' }; });
+      var e0 = tfAddDays(env.today, -31);
+      r.evenements = (db.evenements || []).filter(function (e) { return e.fin.slice(0, 10) >= e0 && e.debut.slice(0, 10) <= maxDay; }).map(function (e) { return { k: e.k, cal: e.cal, titre: e.titre, debut: e.debut, fin: e.fin, tout: !!e.tout, lieu: e.lieu, desc: e.desc, bloque: !!e.bloque, rec: !!e.rec, own: !!e.own }; });
+      r.mensuel = db.meta.mensuel || '';
+      r.attentes = db.attentes.filter(function (a) { return a.jour >= env.today; }).map(function (a) { return { jour: a.jour, client: clientNom(a.clientId) }; });
+      r.blocages = db.blocages; r.busy = db.busy.filter(function (j) { return j >= env.today; });
+      r.syncError = db.meta.syncError || ''; r.agendas = db.meta.agendas || ''; r.backup = db.meta.backup || ''; return r;
+    }
+    function prestaLabel(d) { var a = []; if (d.theorie) a.push('théorie'); if (d.pratique) a.push('pratique'); if (d.test) a.push('test CACES'); return a.join(' + '); }
+    function resume(d) {
+      var l = ['Formation : ' + d.formation + (prestaLabel(d) ? ' (' + prestaLabel(d) + ')' : '')];
+      if (d.categories) l.push('Catégories : ' + d.categories.split(',').join(', '));
+      l.push('Dates : ' + tfFmtJours(d.jours));
+      if (nb(d)) l.push('Stagiaires : ' + nb(d) + (TF_PUBLICS[d.public] ? ' — ' + TF_PUBLICS[d.public].toLowerCase() : ''));
+      else if (TF_PUBLICS[d.public]) l.push('Public : ' + TF_PUBLICS[d.public].toLowerCase());
+      l.push('Type : ' + (d.type === 'FERME' ? 'réservation ferme' : 'à confirmer par l\'entreprise'));
+      if (d.lieu) l.push('Lieu : ' + d.lieu);
+      if (d.horaires) l.push('Horaires : ' + d.horaires.replace('-', ' – '));
+      if (d.contactSite) l.push('Contact sur place : ' + d.contactSite);
+      if (d.remarque) l.push('Remarque : ' + d.remarque);
+      return l;
+    }
+    function mailAdmin(sujet, titre, lignes) {
+      out.mails.push({ to: env.adminEmail, sujet: sujet, titre: titre, lignes: lignes, lien: { label: 'Ouvrir mon espace formateur', url: env.baseUrl + '?admin=' + env.adminKey } });
+    }
+    function mailClient(c, sujet, titre, lignes, d) { // d (facultatif) : la demande concernée → boutons d'action directs dans l'e-mail
+      if (!c || !c.email) return;
+      var m = { to: c.email, sujet: sujet, titre: titre, lignes: lignes, lien: { label: 'Ouvrir mon agenda', url: env.baseUrl + '?c=' + c.token } };
+      if (d && (d.statut === 'ATTENTE' || d.statut === 'VALIDEE')) {
+        var u = env.baseUrl + '?c=' + c.token + '&d=' + d.id + '&x=', a = [];
+        if (d.statut === 'ATTENTE' && d.type === 'OPTION') a.push({ label: 'Confirmer', url: u + 'confirmer' });
+        if (!d.remplace) a.push({ label: d.statut === 'VALIDEE' ? 'Demander un déplacement' : 'Déplacer', url: u + 'deplacer' });
+        if (d.statut === 'ATTENTE') a.push({ label: 'Annuler', url: u + 'annuler' });
+        if (a.length) m.actions = a;
+      }
+      out.mails.push(m);
+    }
+    /* Exécute un changement qui libère des dates ; prévient les entreprises en file d'attente qui passent en tête */
+    function liberer(d, change) {
+      var avant = {};
+      db.demandes.forEach(function (o) { if (o.id !== d.id && o.statut === 'ATTENTE' && partage(d, o)) avant[o.id] = rang(o).rang; });
+      change();
+      db.demandes.forEach(function (o) {
+        if (avant[o.id] > 1 && o.statut === 'ATTENTE' && rang(o).rang === 1)
+          mailClient(clientById(o.clientId), 'Votre option est passée en tête', 'Une date s\'est libérée', ['Bonjour,', 'Une date que vous aviez demandée s\'est libérée : votre demande est maintenant la première de la file.', 'Dates : ' + tfFmtJours(o.jours)].concat(o.type === 'OPTION' ? ['Pensez à confirmer votre formation pour la sécuriser.'] : []), o);
+      });
+    }
+    function normJours(a) { return Array.isArray(a) ? a.filter(function (j, i, x) { return x.indexOf(j) === i; }).sort() : []; }
+    function fiche(q, strict) {
+      if (TF_FORMATIONS.indexOf(q.formation) < 0) fail('Choisissez une formation.');
+      var th = !!q.theorie, pr = !!q.pratique, te = !!q.test;
+      if (te && !TF_TEST[q.formation]) fail('Le test n\'est pas proposé pour cette formation.');
+      if (!th && !pr && !te) fail('Choisissez théorie, pratique ou test.');
+      var list = TF_CATS[q.formation] || [], cats = (Array.isArray(q.categories) ? q.categories : []).filter(function (c, i, a) { return list.indexOf(c) >= 0 && a.indexOf(c) === i; });
+      var n = parseInt(q.stagiaires, 10); if (isNaN(n) || n < 0) n = 0; if (n > 60) n = 60;
+      var pub = TF_PUBLICS[q.public] ? q.public : '';
+      var hr = /^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$/.test(String(q.horaires || '')) ? String(q.horaires) : '';
+      return { horaires: hr, formation: q.formation, theorie: th, pratique: pr, test: te, categories: cats.join(','), stagiaires: n, public: pub,
+        lieu: tfStr(q.lieu, 160), contactSite: tfStr(q.contactSite, 120), remarque: tfStr(q.remarque, 600) };
+    }
+    function nouvelle(f, clientId, jours, type) {
+      var nd = { id: env.uid(), clientId: clientId, jours: jours, formation: f.formation, theorie: f.theorie, pratique: f.pratique, test: f.test, type: type,
+        lieu: f.lieu, remarque: f.remarque, statut: 'ATTENTE', creeLe: env.now, majLe: env.now, eventId: '', sync: '', stagiaires: f.stagiaires, public: f.public,
+        categories: f.categories, contactSite: f.contactSite, expireLe: '', source: 'CLIENT', rappelLe: '', recycleLe: '', remplace: '', rappelFormation: '', horaires: f.horaires || '', histo: '' };
+      nd.rappelLe = rap0(nd); return nd;
+    }
+    function checkJours(jours, clientId, ignore) {
+      if (!jours.length) fail('Sélectionnez au moins un jour.');
+      if (jours.length > 31) fail('31 jours maximum par demande.');
+      jours.forEach(function (j) {
+        if (!tfIsDay(j) || j < minDay || j > maxDay) fail(tfIsDay(j) && j <= env.today ? 'Pour une formation aujourd\'hui ou en urgence, appelez directement Torres Formation.' : 'Une des dates n\'est pas réservable.');
+        var e = etatJour(j, clientId); if (e && e.s === 'x') fail('Une des dates vient d\'être prise. Actualisez et choisissez une autre date.');
+        db.demandes.forEach(function (d) { if (d.clientId === clientId && actif(d) && ignore.indexOf(d.id) < 0 && d.jours.indexOf(j) >= 0) fail('Vous avez déjà une demande sur une de ces dates.'); });
+      });
+    }
+
+    /* ---------- actions client ---------- */
+    if (!isAdmin) {
+      if (action === 'init') { out.data = initClient(); return out; }
+      if (action === 'reserver') {
+        var jours = normJours(p.jours);
+        if (p.type !== 'FERME' && p.type !== 'OPTION') fail('Choisissez réservation ferme ou option.');
+        var f = fiche(p, true);
+        checkJours(jours, client.id, []);
+        var nd = nouvelle(f, client.id, jours, p.type);
+        histo(nd, 'Demande créée (' + (nd.type === 'FERME' ? 'ferme' : 'à confirmer') + ')');
+        db.demandes.push(nd); out.dirty.demandes = true;
+        db.attentes = db.attentes.filter(function (a) { if (a.clientId === client.id && jours.indexOf(a.jour) >= 0) { out.dirty.attentes = true; return false; } return true; });
+        var rg = rang(nd);
+        mailAdmin('Nouvelle demande — ' + client.nom, 'Nouvelle demande de réservation', ['Entreprise : ' + client.nom].concat(resume(nd)).concat(rg.total > 1 ? ['File d\'attente : position ' + rg.rang + ' sur ' + rg.total] : []));
+        mailClient(client, 'Votre demande a bien été reçue', 'Demande enregistrée', ['Bonjour,', 'Votre demande a bien été transmise à Torres Formation. Vous recevrez un e-mail dès qu\'elle sera validée.'].concat(resume(nd)).concat(nd.type === 'OPTION' ? ['Votre demande reste enregistrée. Confirmez-la dès que la formation est certaine.'] : []), nd);
+        out.data = initClient(); out.data.msg = 'Demande envoyée'; return out;
+      }
+      if (action === 'annuler' || action === 'confirmer') {
+        var d = findDem(p.id);
+        if (d.clientId !== client.id) fail('Demande introuvable.');
+        if (d.statut !== 'ATTENTE') fail(d.statut === 'VALIDEE' ? 'Cette formation est déjà validée : demandez un déplacement ou contactez Torres Formation.' : 'Cette demande n\'est plus en cours.');
+        if (action === 'annuler') {
+          liberer(d, function () { d.statut = 'ANNULEE'; d.majLe = env.now; histo(d, 'Annulée par l\'entreprise'); });
+          mailAdmin('Demande annulée — ' + client.nom, 'Demande annulée par le client', ['Entreprise : ' + client.nom].concat(resume(d)));
+          out.data = initClient(); out.data.msg = 'Demande annulée';
+        } else {
+          if (d.type === 'FERME') fail('Cette demande est déjà ferme.');
+          d.type = 'FERME'; d.expireLe = ''; d.rappelLe = ''; d.majLe = env.now; histo(d, 'Confirmée par l\'entreprise');
+          mailAdmin('Option confirmée — ' + client.nom, 'Un client confirme son option', ['Entreprise : ' + client.nom, 'Le client confirme que la formation aura bien lieu.'].concat(resume(d)));
+          out.data = initClient(); out.data.msg = 'Confirmation envoyée';
+        }
+        out.dirty.demandes = true; return out;
+      }
+      if (action === 'deplacer') {
+        var m = findDem(p.id); if (m.clientId !== client.id) fail('Demande introuvable.');
+        var js = normJours(p.jours);
+        if (m.statut === 'ATTENTE') {
+          checkJours(js, client.id, [m.id]);
+          var anc = m.jours;
+          liberer(m, function () { histo(m, 'Déplacée par l\'entreprise (avant : ' + tfFmtJours(anc) + ')'); m.jours = js; m.creeLe = env.now; m.majLe = env.now; m.expireLe = ''; m.rappelLe = rap0(m); });
+          mailAdmin('Dates modifiées — ' + client.nom, 'Un client a déplacé sa demande', ['Entreprise : ' + client.nom, 'Anciennes dates : ' + tfFmtJours(anc)].concat(resume(m)));
+          out.data = initClient(); out.data.msg = 'Demande déplacée';
+        } else if (m.statut === 'VALIDEE') {
+          if (m.jours[m.jours.length - 1] < env.today) fail('Cette formation est passée.');
+          checkJours(js, client.id, [m.id]);
+          db.demandes.forEach(function (o) { if (o.remplace === m.id && o.statut === 'ATTENTE') fail('Une demande de déplacement est déjà en cours pour cette formation.'); });
+          var nm = nouvelle({ formation: m.formation, theorie: !!m.theorie, pratique: !!m.pratique, test: !!m.test, categories: m.categories || '', stagiaires: nb(m), public: m.public || '', lieu: m.lieu, horaires: m.horaires || '', contactSite: m.contactSite || '', remarque: m.remarque }, client.id, js, 'FERME');
+          nm.remplace = m.id; histo(nm, 'Demande de déplacement (actuellement : ' + tfFmtJours(m.jours) + ')'); db.demandes.push(nm);
+          mailAdmin('Demande de déplacement — ' + client.nom, 'Un client demande à déplacer une formation validée', ['Entreprise : ' + client.nom, 'Dates actuelles : ' + tfFmtJours(m.jours), 'La formation actuelle reste valable tant que vous n\'avez pas validé la nouvelle date.'].concat(resume(nm)));
+          mailClient(client, 'Demande de déplacement reçue', 'Demande de déplacement', ['Bonjour,', 'Votre demande de déplacement a bien été transmise. Votre formation actuelle reste valable tant que la nouvelle date n\'est pas validée.'].concat(resume(nm)), nm);
+          out.data = initClient(); out.data.msg = 'Demande de déplacement envoyée';
+        } else fail('Cette demande n\'est plus en cours.');
+        out.dirty.demandes = true; return out;
+      }
+      if (action === 'mensuelClient') { // le client choisit de recevoir (ou non) l'e-mail mensuel
+        client.mensuel = p.on ? '1' : '0'; out.dirty.clients = true;
+        out.data = initClient(); out.data.msg = p.on ? 'E-mail mensuel réactivé' : 'Vous ne recevrez plus l\'e-mail mensuel'; return out;
+      }
+      if (action === 'attente') { // « Prévenez-moi si cette date se libère »
+        var ja = p.jour; if (!tfIsDay(ja) || ja < minDay || ja > maxDay) fail('Date invalide.');
+        var had = db.attentes.some(function (a) { return a.clientId === client.id && a.jour === ja; });
+        db.attentes = db.attentes.filter(function (a) { return !(a.clientId === client.id && a.jour === ja) && a.jour >= env.today; });
+        if (p.on) {
+          var ea = etatJour(ja, client.id); if (!ea || ea.s !== 'x') fail('Cette date est disponible : vous pouvez la réserver directement.');
+          if (db.attentes.filter(function (a) { return a.clientId === client.id; }).length >= 20) fail('20 alertes maximum.');
+          db.attentes.push({ clientId: client.id, jour: ja, creeLe: env.now });
+        }
+        out.dirty.attentes = true; out.data = initClient(); out.data.msg = p.on ? 'Vous serez prévenu si la date se libère' : (had ? 'Alerte retirée' : 'Aucune alerte sur cette date'); return out;
+      }
+      if (action === 'message') {
+        var txt = String(p.texte || '').trim().slice(0, 2000);
+        if (txt.length < 3) fail('Écrivez votre message.');
+        out.mails.push({ to: env.adminEmail, replyTo: client.email || '', sujet: 'Message de ' + client.nom, titre: 'Message d\'un client', lignes: ['Entreprise : ' + client.nom + (client.email ? ' (' + client.email + ')' : ''), txt] });
+        out.data = { msg: 'Message envoyé' }; return out;
+      }
+      fail('Action inconnue.');
+    }
+
+    /* ---------- actions formateur ---------- */
+    function doValider(v, silent) {
+      if (v.statut !== 'ATTENTE') fail('Cette demande n\'est plus en attente.');
+      db.demandes.forEach(function (o) { if (o.id !== v.id && o.id !== v.remplace && o.statut === 'VALIDEE' && partage(v, o)) fail('Une formation est déjà validée sur une de ces dates (' + clientNom(o.clientId) + ').'); });
+      v.statut = 'VALIDEE'; v.type = 'FERME'; v.expireLe = ''; v.majLe = env.now; v.sync = 'A_FAIRE'; histo(v, 'Validée');
+      if (!silent) mailClient(clientById(v.clientId), 'Votre formation est validée', 'Formation validée', ['Bonjour,', 'Bonne nouvelle : votre formation est validée.'].concat(resume(v)).concat(['Je reviendrai vers vous pour les détails pratiques.']), v);
+      if (v.remplace) {
+        var old = demById(v.remplace);
+        if (old && old.statut === 'VALIDEE') { old.statut = 'ANNULEE'; old.majLe = env.now; histo(old, 'Remplacée par un déplacement'); old.sync = old.eventId ? 'A_SUPPRIMER' : ''; }
+      }
+      db.demandes.forEach(function (o) {
+        if (o.id !== v.id && o.statut === 'ATTENTE' && partage(v, o)) {
+          o.statut = 'REFUSEE'; o.majLe = env.now; histo(o, 'Non retenue : date validée pour une autre demande');
+          if (o.clientId === v.clientId) { o.statut = 'ANNULEE'; return; }
+          mailClient(clientById(o.clientId), 'Date indisponible', 'Date non retenue', ['Bonjour,', 'La date demandée n\'est finalement plus disponible.', 'Dates : ' + tfFmtJours(o.jours), 'Vous pouvez choisir une autre date dans votre agenda.']);
+        }
+      });
+    }
+    if (action === 'init') { out.data = initAdmin(); return out; }
+    if (action === 'valider') {
+      doValider(findDem(p.id), false);
+      out.dirty.demandes = true; out.sync = true; out.data = initAdmin(); out.data.msg = 'Formation validée'; return out;
+    }
+    if (action === 'ajouter') { // formation saisie par le formateur (appel téléphonique, etc.)
+      var cl = clientById(p.clientId); if (!cl) fail('Choisissez une entreprise.');
+      var js2 = normJours(p.jours);
+      if (!js2.length) fail('Choisissez au moins un jour.');
+      if (js2.length > 60) fail('60 jours maximum.');
+      js2.forEach(function (j) { if (!tfIsDay(j)) fail('Date invalide.'); });
+      var nd2 = nouvelle(fiche(p, false), cl.id, js2, 'FERME'); nd2.source = 'ADMIN'; histo(nd2, 'Ajoutée par le formateur');
+      doValider(nd2, !p.prevenir);
+      db.demandes.push(nd2);
+      out.dirty.demandes = true; out.sync = true; out.data = initAdmin(); out.data.msg = 'Formation ajoutée pour ' + cl.nom; return out;
+    }
+    if (action === 'refuser') {
+      var r = findDem(p.id);
+      if (r.statut !== 'ATTENTE') fail('Cette demande n\'est plus en attente.');
+      liberer(r, function () { r.statut = 'REFUSEE'; r.majLe = env.now; histo(r, 'Refusée' + (tfStr(p.motif, 300) ? ' : ' + tfStr(p.motif, 300) : '')); });
+      mailClient(clientById(r.clientId), 'Votre demande n\'a pas pu être retenue', 'Demande non retenue', ['Bonjour,', 'Votre demande n\'a pas pu être retenue pour ces dates.', 'Dates : ' + tfFmtJours(r.jours)].concat(tfStr(p.motif, 300) ? ['Message : ' + tfStr(p.motif, 300)] : []).concat(['Vous pouvez choisir une autre date dans votre agenda.']));
+      out.dirty.demandes = true; out.data = initAdmin(); out.data.msg = 'Demande refusée'; return out;
+    }
+    if (action === 'annulerValidee') {
+      var a = findDem(p.id);
+      if (a.statut !== 'VALIDEE') fail('Cette formation n\'est pas validée.');
+      a.statut = 'ANNULEE'; a.majLe = env.now; histo(a, 'Annulée par le formateur'); a.sync = a.eventId ? 'A_SUPPRIMER' : '';
+      mailClient(clientById(a.clientId), 'Formation annulée', 'Formation annulée', ['Bonjour,', 'La formation suivante est annulée.'].concat(resume(a)).concat(['N\'hésitez pas à me contacter pour reprogrammer.']));
+      out.dirty.demandes = true; out.sync = true; out.data = initAdmin(); out.data.msg = 'Formation annulée'; return out;
+    }
+    if (action === 'clientCreer') {
+      var nom = tfStr(p.nom, 80), email = tfStr(p.email, 120).toLowerCase();
+      if (nom.length < 2) fail('Indiquez le nom de l\'entreprise.');
+      if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) fail('Adresse e-mail invalide.');
+      db.clients.push({ id: env.uid(), nom: nom, email: email, token: env.token(), actif: true, creeLe: env.now, mensuel: '1' });
+      out.dirty.clients = true; out.data = initAdmin(); out.data.msg = 'Lien créé pour ' + nom; return out;
+    }
+    if (action === 'clientSupprimer') {
+      var cs = clientById(p.id); if (!cs) fail('Entreprise introuvable.');
+      var evts = false;
+      db.demandes.forEach(function (d) {
+        if (d.clientId !== cs.id) return;
+        if (d.statut === 'ATTENTE') liberer(d, function () { d.statut = 'SUPPRIMEE'; d.majLe = env.now; });
+        else { if (d.eventId && d.statut === 'VALIDEE') { d.sync = 'A_SUPPRIMER'; evts = true; } d.statut = 'SUPPRIMEE'; }
+      });
+      db.demandes = db.demandes.filter(function (d) { return !(d.statut === 'SUPPRIMEE' && d.sync !== 'A_SUPPRIMER'); });
+      db.clients = db.clients.filter(function (c) { return c.id !== cs.id; });
+      if (db.attentes.some(function (a) { return a.clientId === cs.id; })) { db.attentes = db.attentes.filter(function (a) { return a.clientId !== cs.id; }); out.dirty.attentes = true; }
+      out.dirty.clients = true; out.dirty.demandes = true; out.sync = evts; out.data = initAdmin(); out.data.msg = cs.nom + ' supprimée'; return out;
+    }
+    if (action === 'clientActif' || action === 'clientNouveauLien' || action === 'clientEnvoyerLien') {
+      var c = clientById(p.id); if (!c) fail('Entreprise introuvable.');
+      if (action === 'clientActif') { c.actif = !!p.actif; out.dirty.clients = true; out.data = initAdmin(); out.data.msg = c.actif ? 'Lien réactivé' : 'Lien désactivé'; }
+      else if (action === 'clientNouveauLien') { c.token = env.token(); out.dirty.clients = true; out.data = initAdmin(); out.data.msg = 'Nouveau lien généré'; }
+      else {
+        if (!c.email) fail('Aucune adresse e-mail pour cette entreprise.');
+        mailClient(c, 'Votre accès à l\'agenda Torres Formation', 'Votre agenda de réservation', ['Bonjour,', 'Voici votre lien personnel pour consulter mes disponibilités et réserver vos formations en ligne.', 'Aucun compte ni téléchargement : il suffit d\'ouvrir le lien. Conservez-le, il vous est réservé.']);
+        out.data = initAdmin(); out.data.msg = 'Lien envoyé à ' + c.email;
+      }
+      return out;
+    }
+    if (action === 'bloquer') {
+      var du = p.du, au = p.au || p.du;
+      if (!tfIsDay(du) || !tfIsDay(au) || au < du) fail('Dates invalides.');
+      var js3 = []; for (var x = du; x <= au && js3.length < 120; x = tfAddDays(x, 1)) js3.push(x);
+      db.blocages.push({ id: env.uid(), jours: js3, motif: tfStr(p.motif, 80) });
+      out.dirty.blocages = true; out.data = initAdmin(); out.data.msg = js3.length > 1 ? js3.length + ' jours bloqués' : 'Jour bloqué'; return out;
+    }
+    if (action === 'debloquer') {
+      db.blocages = db.blocages.filter(function (b) { return b.id !== p.id; });
+      out.dirty.blocages = true; out.data = initAdmin(); out.data.msg = 'Blocage retiré'; return out;
+    }
+    if (action === 'jourOuvert') { // ouvrir / refermer un week-end ou jour férié aux réservations
+      var jo = p.jour; if (!tfIsDay(jo)) fail('Date invalide.');
+      var ix = db.ouverts.indexOf(jo);
+      if (p.ouvert) { if (ix < 0) db.ouverts.push(jo); } else if (ix >= 0) db.ouverts.splice(ix, 1);
+      db.ouverts = db.ouverts.filter(function (j) { return j >= tfAddDays(env.today, -30); });
+      out.dirty.ouverts = true; out.data = initAdmin(); out.data.msg = p.ouvert ? 'Jour ouvert aux réservations' : 'Jour refermé'; return out;
+    }
+    if (action === 'noteMaj') { // note privée sur une date (vide = supprimée)
+      if (!tfIsDay(p.jour)) fail('Date invalide.');
+      var tn = String(p.texte == null ? '' : p.texte).replace(/\r/g, '').trim().slice(0, 1000);
+      db.notes = (db.notes || []).filter(function (n) { return n.jour !== p.jour; });
+      if (tn) db.notes.push({ jour: p.jour, texte: tn, majLe: env.now });
+      out.dirty.notes = true; out.data = initAdmin(); out.data.msg = tn ? 'Note enregistrée' : 'Note supprimée'; return out;
+    }
+    if (action === 'bilanJour') { // bilan privé d'une journée : prix facturé, stagiaires, texte (tout vide = supprimé)
+      if (!tfIsDay(p.jour)) fail('Date invalide.');
+      var pr = String(p.prix == null ? '' : p.prix).replace(/\s|€/g, '').replace(',', '.'), st = String(p.stagiaires == null ? '' : p.stagiaires).replace(/\s/g, '');
+      if (pr !== '') { if (!/^\d{1,6}(\.\d{1,2})?$/.test(pr)) fail('Prix invalide : écrivez un montant, par exemple 350 ou 420,50.'); pr = String(Number(pr)); }
+      if (st !== '') { if (!/^\d{1,3}$/.test(st)) fail('Nombre de stagiaires invalide.'); st = String(Number(st)); }
+      var tb = String(p.texte == null ? '' : p.texte).replace(/\r/g, '').trim().slice(0, 1000);
+      db.bilans = (db.bilans || []).filter(function (b) { return b.jour !== p.jour; });
+      if (pr !== '' || st !== '' || tb) db.bilans.push({ jour: p.jour, prix: pr, stagiaires: st, texte: tb, majLe: env.now });
+      out.dirty.bilans = true; out.data = initAdmin(); out.data.msg = (pr !== '' || st !== '' || tb) ? 'Bilan de la journée enregistré' : 'Bilan supprimé'; return out;
+    }
+    if (action === 'clientMensuel') {
+      var cm = clientById(p.id); if (!cm) fail('Entreprise introuvable.');
+      cm.mensuel = p.on ? '1' : '0'; out.dirty.clients = true; out.data = initAdmin(); out.data.msg = p.on ? 'E-mail mensuel activé pour ' + cm.nom : 'E-mail mensuel désactivé pour ' + cm.nom; return out;
+    }
+    /* ---- e-mail mensuel des disponibilités ---- */
+    function dispoMois(ym, cid) {
+      var libres = [], opts = [], cl = null, co = null, nb = 0, no = 0;
+      for (var j = ym + '-01'; j.slice(0, 7) === ym; j = tfAddDays(j, 1)) {
+        if (nat(j)) continue; // l'e-mail liste les jours ouvrés ; week-ends et fériés restent réservables dans l'agenda
+        var st = 'x';
+        if (j >= minDay && j <= maxDay && !hard[j]) { var e = etatJour(j, cid); st = !e ? 'l' : e.s === 'o' ? 'o' : 'x'; }
+        if (st === 'l') { nb++; if (cl) { cl[1] = j; cl[2]++; } else { cl = [j, j, 1]; libres.push(cl); } co = null; }
+        else if (st === 'o') { no++; if (co) { co[1] = j; co[2]++; } else { co = [j, j, 1]; opts.push(co); } cl = null; }
+        else { cl = null; co = null; }
+      }
+      return { libres: libres, opts: opts, nb: nb, no: no };
+    }
+    function mensuelMail(c, ym, skipEmpty) {
+      var dm = dispoMois(ym, c.id);
+      if (skipEmpty && !dm.nb) return null;
+      var an = ym.slice(0, 4), mois = TF_MOIS_LONG[+ym.slice(5, 7) - 1], ny = ym.slice(5, 7) === '12' ? (+an + 1) + '-01' : an + '-' + ('0' + (+ym.slice(5, 7) + 1)).slice(-2);
+      var nx = dispoMois(ny, c.id), nxMois = TF_MOIS_LONG[+ny.slice(5, 7) - 1];
+      var td = 'padding:11px 0;border-bottom:1px solid #EDEAE4;';
+      function rows(a, grey) { return a.map(function (r) { return '<tr><td style="' + td + 'font-size:15px;color:' + (grey ? '#6E6B66' : '#0B0B0C') + ';">' + (grey ? '' : '<b>') + tfEscH(tfFmtPlage(r[0], r[1])) + (grey ? '' : '</b>') + '</td><td align="right" style="' + td + 'font-size:13px;color:#6E6B66;white-space:nowrap;">' + r[2] + ' jour' + (r[2] > 1 ? 's' : '') + '</td></tr>'; }).join(''); }
+      var h = '';
+      if (dm.nb) h += '<div style="margin:20px 0 8px;padding:14px 16px;background:#EDEAE4;border-left:3px solid #C22A22;font-size:15px;color:#0B0B0C;"><span style="font-size:28px;font-weight:700;letter-spacing:1px;">' + dm.nb + '</span> jour' + (dm.nb > 1 ? 's' : '') + ' disponible' + (dm.nb > 1 ? 's' : '') + ' en ' + mois + '</div><table role="presentation" width="100%" style="border-collapse:collapse;margin:6px 0 4px;">' + rows(dm.libres, false) + '</table>';
+      if (dm.opts.length) h += '<p style="margin:18px 0 4px;font-size:12px;letter-spacing:2px;text-transform:uppercase;color:#6E6B66;">Sous option par une autre entreprise — peuvent se libérer</p><table role="presentation" width="100%" style="border-collapse:collapse;">' + rows(dm.opts, true) + '</table>';
+      var l = ['Bonjour,', dm.nb ? 'Le mois de ' + mois + ' est entamé : voici mes disponibilités pour vos prochaines formations.' : 'Il ne reste plus de date disponible en ' + mois + ' ' + an + '. Les mois suivants sont ouverts à la réservation dans votre agenda personnel.'];
+      var ex = [];
+      if (nx.nb) ex.push('Et en ' + nxMois + ' : ' + nx.nb + ' jour' + (nx.nb > 1 ? 's' : '') + ' encore disponible' + (nx.nb > 1 ? 's' : '') + '.');
+      ex.push('Vous pouvez réserver via ce lien directement. Je reste disponible pour toute question.');
+      h += ex.map(function (t) { return '<p style="margin:14px 0 0;font-size:15px;line-height:1.5;color:#17171A;">' + tfEscH(t) + '</p>'; }).join('');
+      return { to: c.email, sujet: 'Mes disponibilités de ' + mois + ' ' + an, titre: 'Disponibilités de ' + mois + ' ' + an, lignes: l, bloc: h, fin: ['Au plaisir de contribuer à la sécurité avec vous,', 'Maïcol Torres'],
+        lien: { label: 'Consulter l\'agenda et réserver', url: env.baseUrl + '?c=' + c.token },
+        pied: 'Message automatique envoyé le 1er de chaque mois aux entreprises clientes. <a href="' + tfEscH(env.baseUrl + '?c=' + c.token + '&m=stop') + '" style="color:#6E6B66;">Ne plus recevoir cet e-mail</a>' };
+    }
+    if (action === 'mensuel') {
+      var ym = /^\d{4}-(0[1-9]|1[0-2])$/.test(p.ym || '') ? p.ym : env.today.slice(0, 7);
+      var cibles = db.clients.filter(function (c) { return c.actif && c.email && c.mensuel !== '0'; }), nm2 = 0;
+      if (p.mode === 'apercu') {
+        var c0 = (p.id && clientById(p.id)) || cibles[0] || db.clients[0]; if (!c0) fail('Créez d\'abord une entreprise.');
+        var ma = mensuelMail(c0, ym, false); ma.to = env.adminEmail; ma.sujet = '[Aperçu] ' + ma.sujet; ma.pied = 'APERÇU — exemple avec le lien de « ' + c0.nom + ' ». ' + ma.pied;
+        out.mails.push(ma); out.data = initAdmin(); out.data.msg = 'Aperçu envoyé à ' + env.adminEmail; return out;
+      }
+      cibles.forEach(function (c) { var m2 = mensuelMail(c, ym, true); if (m2) { out.mails.push(m2); nm2++; } });
+      out.data = initAdmin(); out.data.envoyes = nm2; out.data.msg = nm2 ? 'E-mail envoyé à ' + plurielN(nm2, 'entreprise') : 'Aucun envoi : aucune entreprise avec e-mail et des dates libres'; return out;
+    }
+    function plurielN(n, w) { return n + ' ' + w + (n > 1 ? 's' : ''); }
+    if (action === 'digest') { // résumé du lundi pour le formateur
+      var lun = tfAddDays(env.today, -((new Date(env.today + 'T12:00:00Z').getUTCDay() + 6) % 7)), dim = tfAddDays(lun, 6), L = [];
+      var fs = db.demandes.filter(function (d) { return d.statut === 'VALIDEE' && d.jours.some(function (j) { return j >= lun && j <= dim; }); }).sort(function (a, b) { return a.jours[0] < b.jours[0] ? -1 : 1; });
+      var att = db.demandes.filter(function (d) { return d.statut === 'ATTENTE'; });
+      var exp = att.filter(function (d) { return d.type === 'OPTION' && d.jours[0] <= tfAddDays(env.today, 14); });
+      var libres7 = 0; for (var q = env.today; q <= dim; q = tfAddDays(q, 1)) if (!nat(q) && !hard[q] && q >= env.today && !db.demandes.some(function (d) { return d.statut === 'VALIDEE' && d.jours.indexOf(q) >= 0; })) libres7++;
+      if (!fs.length && !att.length) { out.data = { vide: true }; return out; }
+      L.push('Bonjour,', 'Voici votre semaine du ' + tfFmtJours([lun]) + ' au ' + tfFmtJours([dim]) + '.');
+      L.push(fs.length ? 'Formations cette semaine (' + fs.length + ') :' : 'Aucune formation validée cette semaine.');
+      fs.forEach(function (d) { L.push('• ' + clientNom(d.clientId) + ' — ' + d.formation + ' — ' + tfFmtJours(d.jours) + (d.lieu ? ' — ' + d.lieu : '')); });
+      if (att.length) L.push(att.length + ' demande' + (att.length > 1 ? 's' : '') + ' en attente de votre réponse.');
+      exp.forEach(function (d) { L.push('Non confirmé par ' + clientNom(d.clientId) + ' : ' + tfFmtJours(d.jours) + '.'); });
+      L.push(libres7 + ' jour' + (libres7 > 1 ? 's' : '') + ' ouvré' + (libres7 > 1 ? 's' : '') + ' encore libre' + (libres7 > 1 ? 's' : '') + ' d\'ici dimanche.');
+      mailAdmin('Votre semaine du ' + tfFmtJours([lun]).replace(/^\S+ /, ''), 'Résumé de la semaine', L);
+      out.data = {}; return out;
+    }
+    if (action === 'maintenance') { // appelée toutes les 15 min par la synchronisation
+      var ch = false;
+      db.demandes.slice().forEach(function (d) {
+        if (d.statut === 'ATTENTE') {
+          if (d.jours[0] < env.today) { liberer(d, function () { d.statut = 'EXPIREE'; d.majLe = env.now; histo(d, 'Date passée sans validation'); }); ch = true; return; }
+          if (d.type === 'OPTION') { // jamais d'annulation automatique : le formateur est simplement prévenu 14 puis 7 jours avant
+            var lim = d.rappelLe !== '7' && d.jours[0] <= tfAddDays(env.today, 7) ? '7' : !d.rappelLe && d.jours[0] <= tfAddDays(env.today, 14) ? '14' : '';
+            if (lim) {
+              d.rappelLe = lim; ch = true; var nj = Math.round((new Date(d.jours[0] + 'T12:00:00Z') - new Date(env.today + 'T12:00:00Z')) / 86400000);
+              mailAdmin(clientNom(d.clientId) + ' n\'a pas confirmé', 'Formation non confirmée', [clientNom(d.clientId) + ' n\'a pas encore confirmé sa formation, qui commence dans ' + nj + ' jour' + (nj > 1 ? 's' : '') + '.'].concat(resume(d)).concat(['La demande reste en attente : à vous de relancer l\'entreprise, de valider ou de refuser.']));
+            }
+          }
+        } else if (d.statut === 'VALIDEE' && !d.recycleLe && /^(CACES|AIPR)/.test(d.formation)) {
+          var fin = d.jours[d.jours.length - 1];
+          if (fin < env.today && tfAddDays(env.today, -1700) >= fin) {
+            d.recycleLe = env.today; ch = true;
+            var echeance = (+fin.slice(0, 4) + 5) + fin.slice(4);
+            var cx = clientById(d.clientId);
+            mailClient(cx, 'Pensez au recyclage', 'Recyclage à prévoir', ['Bonjour,', 'La formation « ' + d.formation + ' » réalisée du ' + tfFmtJours(d.jours) + ' arrive à échéance vers le ' + tfFmtJours([echeance]) + '.', 'C\'est le bon moment pour planifier le recyclage de vos équipes.']);
+            mailAdmin('Recyclage à proposer — ' + clientNom(d.clientId), 'Recyclage à proposer', ['Entreprise : ' + clientNom(d.clientId), 'Formation : ' + d.formation, 'Réalisée : ' + tfFmtJours(d.jours), 'Échéance vers le ' + tfFmtJours([echeance]), cx && cx.email ? 'Un rappel a été envoyé au client.' : 'Pas d\'e-mail enregistré : pensez à le contacter.']);
+          }
+        }
+      });
+      if (ch) out.dirty.demandes = true;
+      out.data = {}; return out;
+    }
+    if (action === '__attentes') { // interne : une date surveillée s'est-elle libérée ?
+      var keepA = [];
+      db.attentes.forEach(function (a) {
+        if (a.jour < env.today) { out.dirty.attentes = true; return; }
+        var ca = clientById(a.clientId);
+        if (!ca) { out.dirty.attentes = true; return; }
+        if (a.jour >= minDay && !etatJour(a.jour, a.clientId)) {
+          out.dirty.attentes = true;
+          if (ca.actif && !db.demandes.some(function (d) { return d.clientId === a.clientId && actif(d) && d.jours.indexOf(a.jour) >= 0; }))
+            mailClient(ca, 'Une date s\'est libérée', 'Date de nouveau disponible', ['Bonjour,', 'La date du ' + tfFmtJours([a.jour]) + ', pour laquelle vous aviez demandé à être prévenu, est de nouveau disponible.', 'Elle n\'est pas réservée pour vous : la première demande reçue est servie.']);
+          return;
+        }
+        keepA.push(a);
+      });
+      db.attentes = keepA; out.data = {}; return out;
+    }
+    fail('Action inconnue.');
+  } catch (e) {
+    if (e && e.tf) return { ok: false, error: e.message, mails: [], dirty: {}, sync: false };
+    throw e;
+  }
+}
