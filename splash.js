@@ -387,7 +387,8 @@ function demarrer() {
     if (!visible || !pret) return;
     if (!t0) { t0 = maintenant - (dejaVu ? 99000 : 0); dernier = maintenant; }
     const brut = (maintenant - dernier) / 1000;
-    const t = (maintenant - t0) / 1000 * 1.7;   // agenda : animation accélérée (≈ 2,3 s)
+    const t = (maintenant - t0) / 1000 * 2;   // agenda : animation accélérée
+    if (!annonceFin && t >= T_IMPACT + 0.25) { annonceFin = true; signal('tf:splash-fini'); } // l'agenda s'ouvre dès que le T est tombé
     const enAnim = t < FIN;
     const libre = auRepos();
     const mouvement = !libre || Math.abs(tourCible - lisse.tour) > 0.001 || Math.abs(cible.x - lisse.x) > 0.001 || Math.abs(cible.y - lisse.y) > 0.001;
